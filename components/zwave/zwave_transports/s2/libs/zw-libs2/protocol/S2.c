@@ -38,6 +38,11 @@ CTR_DRBG_CTX s2_ctr_drbg;
 
 #define AUTH_TAG_LEN 8
 
+/* Incoming ciphertext backup for SPAN retry and security-class iteration.
+ * Kept off ctxt->workbuf so RX can restore the frame while TX owns workbuf
+ * (VERIFYING_DELIVERY / SENDING_MSG). Sized for one Z-Wave MSDU. */
+#define S2_RX_CIPHERTEXT_BACKUP_SIZE 158
+
 /* Maximum number of SPAN retry iterations for decryption.
  * Per Z-Wave specification: "The maximum number of iterations performed by a
  * receiving node MUST be in the range 1..5." We use 5 for maximum compatibility. */
@@ -765,14 +770,14 @@ static decrypt_return_code_t S2_decrypt_msg(struct S2 *p_context, s2_connection_
         /*In this state we don't know which class_id was used to encrypt the frame, so
          * we will try de-crypting with all our classes */
 
-        /*Check the fsm before using the workbuf. Need backup for both INSTANTIATE (class iteration)
-         * and NEGOTIATED (SPAN retry) cases, as CCM_decrypt_and_auth modifies ciphertext in place */
-        if (ctxt->fsm == IDLE && (span->state == SPAN_INSTANTIATE || span->state == SPAN_NEGOTIATED)) {
-            if (ciphertext_len > sizeof(ctxt->workbuf)) {
-                goto auth_fail;
-            }
-            memcpy(ctxt->workbuf, ciphertext, ciphertext_len);
+        /* CCM_decrypt_and_auth modifies ciphertext in place. Back it up locally so
+         * SPAN retry and SPAN_INSTANTIATE class iteration work while the FSM is not
+         * IDLE and ctxt->workbuf holds an outgoing frame. */
+        uint8_t ciphertext_backup[S2_RX_CIPHERTEXT_BACKUP_SIZE];
+        if (ciphertext_len > sizeof(ciphertext_backup)) {
+            goto auth_fail;
         }
+        memcpy(ciphertext_backup, ciphertext, ciphertext_len);
 
         for (i = 0; i < N_SEC_CLASS; i++) {
             /*Only decrypt with a key which is loaded */
@@ -789,7 +794,7 @@ static decrypt_return_code_t S2_decrypt_msg(struct S2 *p_context, s2_connection_
                 for (uint8_t span_attempt = 0; span_attempt < max_span_attempts; span_attempt++) {
                     /* Restore ciphertext before each retry attempt, as CCM_decrypt_and_auth modifies it in place */
                     if (span_attempt > 0) {
-                        memcpy(ciphertext, ctxt->workbuf, ciphertext_len);
+                        memcpy(ciphertext, ciphertext_backup, ciphertext_len);
                     }
 
                     next_nonce_generate(&span->d.rng, nonce);
@@ -829,11 +834,9 @@ static decrypt_return_code_t S2_decrypt_msg(struct S2 *p_context, s2_connection_
                 }
             }
 
-            if (ctxt->fsm != IDLE || span->state == SPAN_NEGOTIATED) {
-                /* Two failure cases:
-                 * 1) ctxt->fsm != IDLE: workbuf in use, cannot backup ciphertext for class iteration
-                 * 2) span->state == SPAN_NEGOTIATED: Already know the correct key and tried SPAN retries.
-                 *    Should not iterate through other security classes. Genuine auth failure. */
+            if (span->state == SPAN_NEGOTIATED) {
+                /* Already know the correct key and tried SPAN retries.
+                 * Should not iterate through other security classes. Genuine auth failure. */
                 goto auth_fail;
             }
 
@@ -844,7 +847,7 @@ static decrypt_return_code_t S2_decrypt_msg(struct S2 *p_context, s2_connection_
             }
 
             // Restore the ciphertext
-            memcpy(ciphertext, ctxt->workbuf, ciphertext_len);
+            memcpy(ciphertext, ciphertext_backup, ciphertext_len);
 
             /*reset prng to the negotiated state with the right new test key */
             next_nonce_instantiate(&span->d.rng, s_nonce, r_nonce, ctxt->sg[span->class_id].nonce_key);
